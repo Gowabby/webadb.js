@@ -649,47 +649,46 @@ var Adb = {};
 
 	Adb.Stream.prototype.push = function(file, filename, mode, on_progress = null) {
 		// read the whole file
-		let seq = new Promise(function(resolve, reject) {
-			let reader = new FileReader();
-			reader.onload = e => resolve(e.target.result);
-			reader.onerror = e => reject(e.target.error);
-			reader.readAsArrayBuffer(file);
-		});
+		return read_blob(file).then(data => {
+			// we need to reduce logging during the data transfer, otherwise the console may explode
+			let old_debug = Adb.Opt.debug;
+			let old_dump = Adb.Opt.dump;
 
-		// we need reduced logging during the data transfer otherwise the console may explode
-		let old_debug = Adb.Opt.debug;
-		let old_dump = Adb.Opt.dump;
-		Adb.Opt.debug = false;
-		Adb.Opt.dump = false;
+			return this.push_start(filename, mode).then(() => {
+				if (file.size == 0)
+					return;
 
-		return seq.then(data =>
-			this.push_start(filename, mode).then(() => {
-				let seq = Promise.resolve();
-				let rem = file.size;
 				let max = Math.min(0x10000, this.device.max_payload);
-				while (rem > 0) {
+				Adb.Opt.debug = false;
+				Adb.Opt.dump = false;
+
+				return (function push_next(stream, rem) {
 					// these two are needed here for the closure
 					let len = Math.min(rem, max);
-					let count = file.size - rem;
-					seq = seq.then(() => {
-						if (this.cancel) {
-							Adb.Opt.debug = old_debug;
-							Adb.Opt.dump = old_dump;
-							this.cancel();
+					let pos = file.size - rem;
+					return stream.push_data(data.slice(pos, pos + len)).then(function push_prog() {
+						if (stream.cancel) {
+							stream.cancel();
 							throw new Error("cancelled");
 						}
 						if (on_progress != null)
-							on_progress(count, file.size);
-						return this.push_data(data.slice(count, count + len));
+							on_progress(pos, file.size);
+						if (rem - len > 0)
+							return push_next(stream, rem - len);
 					});
-					rem -= len;
-				}
-				return seq.then(() => {
-					Adb.Opt.debug = old_debug;
-					Adb.Opt.dump = old_dump;
-					return this.push_done();
-				});
-			}));
+				})(this, file.size);
+			})
+			.then(() => {
+				Adb.Opt.debug = old_debug;
+				Adb.Opt.dump = old_dump;
+				return this.push_done();
+			})
+			.catch(e => {
+				Adb.Opt.debug = old_debug;
+				Adb.Opt.dump = old_dump;
+				return this.push_done().then(() => { throw e; });
+			})
+		});
 	};
 
 	Adb.Stream.prototype.quit = function() {
@@ -756,7 +755,7 @@ var Adb = {};
 
 	function toB64(buffer)
 	{
-		return btoa(new Uint8Array(buffer).reduce((s, b) => s + String.fromCharCode(b), ""));
+		return btoa(new Uint8Array(buffer).reduce(function toB64(s, b) { s + String.fromCharCode(b) }, ""));
 	}
 
 	function hexdump(view, prefix="")
@@ -914,6 +913,16 @@ var Adb = {};
 
 		return crypto.subtle.exportKey("spki", key.publicKey)
 			.then(pubkey => console.log("-----BEGIN PUBLIC KEY-----\n" + toB64(pubkey) + "\n-----END PUBLIC KEY-----"));
+	}
+
+	function read_blob(blob)
+	{
+		return new Promise(function(resolve, reject) {
+			let reader = new FileReader();
+			reader.onload = e => resolve(e.target.result);
+			reader.onerror = e => reject(e.target.error);
+			reader.readAsArrayBuffer(blob);
+		});
 	}
 
 	function promisify(request, onsuccess = "onsuccess", onerror = "onerror")
